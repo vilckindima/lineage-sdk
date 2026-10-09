@@ -31,4 +31,7 @@ interface IHealthInterface {
     int[] getSupportedFastChargeModes();
     int getFastChargeMode();
     boolean setFastChargeMode(int mode);
+
+    // Google UI requests and boot restoration share the charging-owner service.
+    boolean setGoogleChargingPolicy(int policy, boolean restore);
 }

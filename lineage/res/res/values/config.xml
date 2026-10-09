@@ -348,6 +348,8 @@
 
     <!-- Whether charging control should be enabled by default -->
     <bool name="config_chargingControlEnabled">false</bool>
+    <!-- Device opt-in: coordinate Lineage limits with the Google Battery V5 HAL. -->
+    <bool name="config_chargingControlGooglePolicy">false</bool>
 
     <!-- Default charging control mode.
          This integer should be set to:

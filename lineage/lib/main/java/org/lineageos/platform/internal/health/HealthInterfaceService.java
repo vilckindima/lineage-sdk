@@ -8,6 +8,7 @@ package org.lineageos.platform.internal.health;
 import android.Manifest;
 import android.content.Context;
 import android.os.Handler;
+import android.os.Binder;
 import android.os.IBinder;
 import android.os.Process;
 import android.util.Log;
@@ -106,7 +107,10 @@ public class HealthInterfaceService extends LineageSystemService {
 
         @Override
         public boolean setChargingControlEnabled(boolean enabled) {
-            return mCCC.setEnabled(enabled);
+            mContext.enforceCallingOrSelfPermission(Manifest.permission.DEVICE_POWER, TAG);
+            long token = Binder.clearCallingIdentity();
+            try { return mCCC.setEnabled(enabled); }
+            finally { Binder.restoreCallingIdentity(token); }
         }
 
         @Override
@@ -116,7 +120,10 @@ public class HealthInterfaceService extends LineageSystemService {
 
         @Override
         public boolean setChargingControlMode(int mode) {
-            return mCCC.setMode(mode);
+            mContext.enforceCallingOrSelfPermission(Manifest.permission.DEVICE_POWER, TAG);
+            long token = Binder.clearCallingIdentity();
+            try { return mCCC.setMode(mode); }
+            finally { Binder.restoreCallingIdentity(token); }
         }
 
         @Override
@@ -126,7 +133,10 @@ public class HealthInterfaceService extends LineageSystemService {
 
         @Override
         public boolean setChargingControlStartTime(int startTime) {
-            return mCCC.setStartTime(startTime);
+            mContext.enforceCallingOrSelfPermission(Manifest.permission.DEVICE_POWER, TAG);
+            long token = Binder.clearCallingIdentity();
+            try { return mCCC.setStartTime(startTime); }
+            finally { Binder.restoreCallingIdentity(token); }
         }
 
         @Override
@@ -136,7 +146,10 @@ public class HealthInterfaceService extends LineageSystemService {
 
         @Override
         public boolean setChargingControlTargetTime(int targetTime) {
-            return mCCC.setTargetTime(targetTime);
+            mContext.enforceCallingOrSelfPermission(Manifest.permission.DEVICE_POWER, TAG);
+            long token = Binder.clearCallingIdentity();
+            try { return mCCC.setTargetTime(targetTime); }
+            finally { Binder.restoreCallingIdentity(token); }
         }
 
         @Override
@@ -146,12 +159,18 @@ public class HealthInterfaceService extends LineageSystemService {
 
         @Override
         public boolean setChargingControlLimit(int limit) {
-            return mCCC.setLimit(limit);
+            mContext.enforceCallingOrSelfPermission(Manifest.permission.DEVICE_POWER, TAG);
+            long token = Binder.clearCallingIdentity();
+            try { return mCCC.setLimit(limit); }
+            finally { Binder.restoreCallingIdentity(token); }
         }
 
         @Override
         public boolean resetChargingControl() {
-            return mCCC.reset();
+            mContext.enforceCallingOrSelfPermission(Manifest.permission.DEVICE_POWER, TAG);
+            long token = Binder.clearCallingIdentity();
+            try { return mCCC.reset(); }
+            finally { Binder.restoreCallingIdentity(token); }
         }
 
         @Override
@@ -179,6 +198,14 @@ public class HealthInterfaceService extends LineageSystemService {
         @Override
         public boolean setFastChargeMode(int mode) {
             return mFCC.setFastChargeMode(mode);
+        }
+
+        @Override
+        public boolean setGoogleChargingPolicy(int policy, boolean restore) {
+            mContext.enforceCallingOrSelfPermission(Manifest.permission.DEVICE_POWER, TAG);
+            long token = Binder.clearCallingIdentity();
+            try { return mCCC.setGoogleChargingPolicy(policy, restore); }
+            finally { Binder.restoreCallingIdentity(token); }
         }
 
         @Override

@@ -14,6 +14,10 @@ import static org.lineageos.platform.internal.health.Util.getTimeMillisFromSecon
 import static org.lineageos.platform.internal.health.Util.msToString;
 
 import android.app.AlarmManager;
+import android.app.ActivityManager;
+import android.provider.Settings;
+import vendor.lineage.health.ChargingControlSupportedMode;
+import vendor.lineage.health.ChargingLimitInfo;
 import android.content.BroadcastReceiver;
 import android.content.ContentResolver;
 import android.content.Context;
@@ -46,6 +50,124 @@ public class ChargingControlController extends LineageHealthFeature {
     private LineageHealthBatteryBroadcastReceiver mBattReceiver;
     private BroadcastReceiver mAlarmBroadcastReceiver;
     private boolean mIsEnabled = false;
+
+    private static final String OWNER = "evox_charging_control_owner";
+    private static final String GOOGLE_MODE = "charge_optimization_mode";
+    private final boolean mUseOwner;
+    private boolean mStarted;
+    private final ChargingControlOwner mOwner = new ChargingControlOwner(new ChargingControlOwner.Backend() {
+        public int readOwner() {
+            return Settings.Global.getInt(mContentResolver, OWNER, -1);
+        }
+        public boolean googleSelected() {
+            return Settings.Secure.getIntForUser(mContentResolver, GOOGLE_MODE, 0,
+                    ActivityManager.getCurrentUser()) == 1;
+        }
+        public boolean lineageSelected() { return readLineageEnabled(); }
+        public void saveOwner(int owner) {
+            if (!Settings.Global.putInt(mContentResolver, OWNER, owner)) {
+                throw new IllegalStateException("Cannot save charging owner");
+            }
+        }
+        public void mirror(int owner) {
+            int user = ActivityManager.getCurrentUser();
+            int google = owner == ChargingControlOwner.GOOGLE ? 1 : 0;
+            int lineage = owner == ChargingControlOwner.LINEAGE ? 1 : 0;
+            // Clear the previous UI before enabling the new one. These are mirrors only:
+            // a late Settings Intelligence write cannot change the canonical owner.
+            if (google == 0) writeGoogleMode(0, user);
+            if (LineageSettings.System.getIntForUser(mContentResolver,
+                    LineageSettings.System.CHARGING_CONTROL_ENABLED, 0, user) != lineage
+                    && !LineageSettings.System.putIntForUser(mContentResolver,
+                    LineageSettings.System.CHARGING_CONTROL_ENABLED, lineage, user)) {
+                throw new IllegalStateException("Cannot mirror Lineage charging mode");
+            }
+            if (google == 1) writeGoogleMode(1, user);
+        }
+        public void releaseLineage() throws Exception { releaseLineageControl(); }
+        public void applyGoogle(int policy) throws Exception { GoogleChargingPolicy.set(policy); }
+        public void activateLineage() throws Exception {
+            handleSettingChange();
+            // Limit's legacy provider logs write failures instead of throwing them.
+            // Verify the limit before reporting a successful transfer to the UI.
+            if (getMode() == MODE_LIMIT && mCurrentProvider == mLimit && mIsPowerConnected
+                    && mChargingControl.getChargingLimit().max != getLimit()) {
+                throw new IllegalStateException("Lineage charging limit was not applied");
+            }
+        }
+    });
+
+    private void writeGoogleMode(int mode, int user) {
+        if (Settings.Secure.getIntForUser(mContentResolver, GOOGLE_MODE, -1, user) != mode
+                && !Settings.Secure.putIntForUser(mContentResolver, GOOGLE_MODE, mode, user)) {
+            throw new IllegalStateException("Cannot mirror Google charging mode");
+        }
+    }
+
+    private boolean readLineageEnabled() {
+        return LineageSettings.System.getIntForUser(mContentResolver,
+                LineageSettings.System.CHARGING_CONTROL_ENABLED, 0,
+                ActivityManager.getCurrentUser()) != 0;
+    }
+
+    /** Unknown owner is blocked until migration succeeds, including when HAL is late. */
+    private boolean ownsLineageHardware() {
+        return !mUseOwner || Settings.Global.getInt(mContentResolver, OWNER, -1)
+                == ChargingControlOwner.LINEAGE;
+    }
+
+    public synchronized boolean setGoogleChargingPolicy(int policy, boolean restore) {
+        if (!mUseOwner || !mStarted || !isSupported()) return false;
+        try {
+            return mOwner.google(policy, restore);
+        } catch (Exception e) {
+            Log.e(TAG, "Google charging ownership transfer failed", e);
+            return false;
+        }
+    }
+
+    private void stopLineageMonitoring() {
+        if (mBattReceiver != null) {
+            mContext.unregisterReceiver(mBattReceiver);
+            mBattReceiver = null;
+        }
+        if (mAlarmBroadcastReceiver != null) {
+            mContext.unregisterReceiver(mAlarmBroadcastReceiver);
+            mAlarmBroadcastReceiver = null;
+        }
+        mIsEnabled = false;
+        mChargingNotification.cancel();
+    }
+
+    /** Provider reset swallows exceptions; independently verify release through the HAL. */
+    private void releaseLineageControl() throws Exception {
+        stopLineageMonitoring();
+        mDeadline.disable();
+        mLimit.disable();
+        mToggle.disable();
+        int modes = mChargingControl.getSupportedMode();
+        if ((modes & ChargingControlSupportedMode.DEADLINE) != 0) {
+            mChargingControl.setChargingDeadline(-1);
+        }
+        if ((modes & ChargingControlSupportedMode.LIMIT) != 0) {
+            ChargingLimitInfo limit = new ChargingLimitInfo();
+            limit.min = 0;
+            limit.max = 100;
+            mChargingControl.setChargingLimit(limit);
+            ChargingLimitInfo actual = mChargingControl.getChargingLimit();
+            if (actual.min != 0 || actual.max != 100) {
+                throw new IllegalStateException("Lineage limit not released");
+            }
+        }
+        if ((modes & ChargingControlSupportedMode.TOGGLE) != 0) {
+            mChargingControl.setChargingEnabled(true);
+            if (!mChargingControl.getChargingEnabled()) {
+                throw new IllegalStateException("Lineage charging toggle not released");
+            }
+        }
+    }
+
+    private final Runnable mReconcile = this::handleSettingChange;
 
     // Defaults
     private boolean mDefaultEnabled = false;
@@ -81,6 +203,7 @@ public class ChargingControlController extends LineageHealthFeature {
         super(context, handler);
 
         mContentResolver = mContext.getContentResolver();
+        mUseOwner = mContext.getResources().getBoolean(R.bool.config_chargingControlGooglePolicy);
         mChargingControl = IChargingControl.Stub.asInterface(
                 ServiceManager.waitForDeclaredService(
                         IChargingControl.DESCRIPTOR + "/default"));
@@ -127,32 +250,41 @@ public class ChargingControlController extends LineageHealthFeature {
         return mChargingControl != null;
     }
 
-    public boolean isEnabled() {
-        return LineageSettings.System.getInt(mContentResolver,
-                LineageSettings.System.CHARGING_CONTROL_ENABLED, 0) != 0;
+    public synchronized boolean isEnabled() {
+        return mUseOwner ? ownsLineageHardware() : readLineageEnabled();
     }
 
-    public boolean setEnabled(boolean enabled) {
-        putBoolean(LineageSettings.System.CHARGING_CONTROL_ENABLED, enabled);
-        return true;
+    public synchronized boolean setEnabled(boolean enabled) {
+        if (!mUseOwner) {
+            putBoolean(LineageSettings.System.CHARGING_CONTROL_ENABLED, enabled);
+            return true;
+        }
+        if (!mStarted || !isSupported()) return false;
+        try {
+            return mOwner.lineage(enabled);
+        } catch (Exception e) {
+            Log.e(TAG, "Lineage charging ownership transfer failed", e);
+            return false;
+        }
     }
 
     public int getMode() {
-        return LineageSettings.System.getInt(mContentResolver,
+        return LineageSettings.System.getIntForUser(mContentResolver,
                 LineageSettings.System.CHARGING_CONTROL_MODE,
-                mDefaultMode);
+                mDefaultMode, ActivityManager.getCurrentUser());
     }
 
-    public boolean setMode(int mode) {
+    public synchronized boolean setMode(int mode) {
         if (mode < MODE_NONE || mode > MODE_LIMIT) {
             return false;
         }
 
-        mCurrentProvider = getProviderForMode(mode);
-
-        if (mCurrentProvider == null) {
-            return false;
+        ChargingControlProvider next = getProviderForMode(mode);
+        if (next == null) return false;
+        if (ownsLineageHardware() && mCurrentProvider != null && next != mCurrentProvider) {
+            mCurrentProvider.disable();
         }
+        mCurrentProvider = next;
 
         putInt(LineageSettings.System.CHARGING_CONTROL_MODE, mode);
         return true;
@@ -186,12 +318,12 @@ public class ChargingControlController extends LineageHealthFeature {
     }
 
     public int getStartTime() {
-        return LineageSettings.System.getInt(mContentResolver,
+        return LineageSettings.System.getIntForUser(mContentResolver,
                 LineageSettings.System.CHARGING_CONTROL_START_TIME,
-                mDefaultStartTime);
+                mDefaultStartTime, ActivityManager.getCurrentUser());
     }
 
-    public boolean setStartTime(int time) {
+    public synchronized boolean setStartTime(int time) {
         if (time < 0 || time > 24 * 60 * 60) {
             return false;
         }
@@ -201,12 +333,12 @@ public class ChargingControlController extends LineageHealthFeature {
     }
 
     public int getTargetTime() {
-        return LineageSettings.System.getInt(mContentResolver,
+        return LineageSettings.System.getIntForUser(mContentResolver,
                 LineageSettings.System.CHARGING_CONTROL_TARGET_TIME,
-                mDefaultTargetTime);
+                mDefaultTargetTime, ActivityManager.getCurrentUser());
     }
 
-    public boolean setTargetTime(int time) {
+    public synchronized boolean setTargetTime(int time) {
         if (time < 0 || time > 24 * 60 * 60) {
             return false;
         }
@@ -216,12 +348,12 @@ public class ChargingControlController extends LineageHealthFeature {
     }
 
     public int getLimit() {
-        return LineageSettings.System.getInt(mContentResolver,
+        return LineageSettings.System.getIntForUser(mContentResolver,
                 LineageSettings.System.CHARGING_CONTROL_LIMIT,
-                mDefaultLimit);
+                mDefaultLimit, ActivityManager.getCurrentUser());
     }
 
-    public boolean setLimit(int limit) {
+    public synchronized boolean setLimit(int limit) {
         if (limit < 0 || limit > 100) {
             return false;
         }
@@ -230,12 +362,12 @@ public class ChargingControlController extends LineageHealthFeature {
         return true;
     }
 
-    public boolean reset() {
+    public synchronized boolean reset() {
         return setEnabled(mDefaultEnabled) && setMode(mDefaultMode) && setLimit(mDefaultLimit)
                 && setStartTime(mDefaultStartTime) && setTargetTime(mDefaultTargetTime);
     }
 
-    private void updateBatteryInfo(Intent intent) {
+    private synchronized void updateBatteryInfo(Intent intent) {
         int battStatus = intent.getIntExtra(BatteryManager.EXTRA_STATUS, -1);
         int battPlugged = intent.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0);
 
@@ -262,7 +394,7 @@ public class ChargingControlController extends LineageHealthFeature {
         Log.i(TAG, "mIsPowerConnected: " + mIsPowerConnected + ", mBatteryPct: " + mBatteryPct);
     }
 
-    private void updateBatteryInfo() {
+    private synchronized void updateBatteryInfo() {
         IntentFilter ifilter = new IntentFilter(Intent.ACTION_BATTERY_CHANGED);
         Intent batteryStatus = mContext.registerReceiver(null, ifilter, Context.RECEIVER_EXPORTED);
         if (batteryStatus == null) {
@@ -273,14 +405,19 @@ public class ChargingControlController extends LineageHealthFeature {
     }
 
     @Override
-    public void onStart() {
+    public synchronized void onStart() {
         if (mCurrentProvider == null || mChargingControl == null) {
             return;
         }
 
         // Register setting observer
-        registerSettings(MODE_URI, LIMIT_URI, ENABLED_URI, START_TIME_URI, TARGET_TIME_URI);
-
+        if (mUseOwner) {
+            registerSettings(MODE_URI, LIMIT_URI, ENABLED_URI, START_TIME_URI, TARGET_TIME_URI,
+                    Settings.Secure.getUriFor(GOOGLE_MODE), Settings.Global.getUriFor(OWNER));
+        } else {
+            registerSettings(MODE_URI, LIMIT_URI, ENABLED_URI, START_TIME_URI, TARGET_TIME_URI);
+        }
+        mStarted = true;
         handleSettingChange();
     }
 
@@ -292,7 +429,8 @@ public class ChargingControlController extends LineageHealthFeature {
         }
     }
 
-    protected void resetInternalState() {
+    protected synchronized void resetInternalState() {
+        if (!ownsLineageHardware()) return;
         if (mCurrentProvider == null) {
             return;
         }
@@ -303,7 +441,8 @@ public class ChargingControlController extends LineageHealthFeature {
         mCurrentProvider.reset();
     }
 
-    protected void setChargingCancelledOnce() {
+    protected synchronized void setChargingCancelledOnce() {
+        if (!ownsLineageHardware()) return;
         if (mCurrentProvider == null) {
             return;
         }
@@ -330,7 +469,7 @@ public class ChargingControlController extends LineageHealthFeature {
         mChargingNotification.cancel();
     }
 
-    private void onPowerConnected() {
+    private synchronized void onPowerConnected() {
         if (mBattReceiver == null) {
             mBattReceiver = new LineageHealthBatteryBroadcastReceiver();
         } else {
@@ -340,7 +479,7 @@ public class ChargingControlController extends LineageHealthFeature {
         mContext.registerReceiver(mBattReceiver, battFilter);
     }
 
-    private void onPowerDisconnected() {
+    private synchronized void onPowerDisconnected() {
         if (mBattReceiver != null) {
             mContext.unregisterReceiver(mBattReceiver);
             mBattReceiver = null;
@@ -350,7 +489,7 @@ public class ChargingControlController extends LineageHealthFeature {
         resetInternalState();
     }
 
-    private void onPowerStatus(boolean enable) {
+    private synchronized void onPowerStatus(boolean enable) {
         // Don't do anything if it is not enabled
         if (!isEnabled()) {
             return;
@@ -418,7 +557,8 @@ public class ChargingControlController extends LineageHealthFeature {
         return new ChargeTime(startTime, targetTime);
     }
 
-    protected void updateChargeControl() {
+    protected synchronized void updateChargeControl() {
+        if (!ownsLineageHardware()) return;
         if (mCurrentProvider == null) {
             return;
         }
@@ -489,7 +629,22 @@ public class ChargingControlController extends LineageHealthFeature {
         return mCurrentProvider.isChargingControlModeSupported(mode);
     }
 
-    private void handleSettingChange() {
+    private synchronized void handleSettingChange() {
+        if (mUseOwner) {
+            try {
+                mOwner.reconcile();
+                mHandler.removeCallbacks(mReconcile);
+            } catch (Exception e) {
+                Log.w(TAG, "Charging owner reconciliation failed; retrying", e);
+                mHandler.removeCallbacks(mReconcile);
+                mHandler.postDelayed(mReconcile, 5000);
+                return;
+            }
+            if (!ownsLineageHardware()) {
+                stopLineageMonitoring();
+                return;
+            }
+        }
         int mode = getMode();
 
         if (mIsEnabled != isEnabled()) {
@@ -530,14 +685,16 @@ public class ChargingControlController extends LineageHealthFeature {
     }
 
     @Override
-    protected void onSettingsChanged(Uri uri) {
+    protected synchronized void onSettingsChanged(Uri uri) {
         handleSettingChange();
     }
 
     @Override
-    public void dump(PrintWriter pw) {
+    public synchronized void dump(PrintWriter pw) {
         pw.println();
         pw.println("ChargingControlController Configuration:");
+        pw.println("  Google arbitration: " + mUseOwner);
+        pw.println("  Charging owner: " + Settings.Global.getInt(mContentResolver, OWNER, -1));
         pw.println("  Enabled: " + isEnabled());
         pw.println("  Mode: " + getMode());
         pw.println("  Limit: " + getLimit());
