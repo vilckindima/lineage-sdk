@@ -150,11 +150,17 @@ public class ChargingControlController extends LineageHealthFeature {
             mChargingControl.setChargingDeadline(-1);
         }
         if ((modes & ChargingControlSupportedMode.LIMIT) != 0) {
-            ChargingLimitInfo limit = new ChargingLimitInfo();
-            limit.min = 0;
-            limit.max = 100;
-            mChargingControl.setChargingLimit(limit);
             ChargingLimitInfo actual = mChargingControl.getChargingLimit();
+            // The provider above normally already reset the limit. Google charger
+            // sysfs rejects writes of an unchanged threshold with EINVAL, so a
+            // second setChargingLimit(0, 100) would turn success into a failure.
+            if (actual.min != 0 || actual.max != 100) {
+                ChargingLimitInfo limit = new ChargingLimitInfo();
+                limit.min = 0;
+                limit.max = 100;
+                mChargingControl.setChargingLimit(limit);
+                actual = mChargingControl.getChargingLimit();
+            }
             if (actual.min != 0 || actual.max != 100) {
                 throw new IllegalStateException("Lineage limit not released");
             }
